@@ -6,6 +6,8 @@ use std::fs;
 use std::io;
 use std::io::prelude::*;
 use std::io::BufReader;
+use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -42,6 +44,8 @@ enum Command {
 
         tree_ish: String,
     },
+
+    WriteTree,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -121,7 +125,7 @@ fn main() -> anyhow::Result<()> {
 
                         let without_ending_null = buf.split_last().context("split last")?.1;
                         let mut iter = without_ending_null.splitn(2, |&b| b == b' ');
-                        let mode = iter.next().context("get tree entry mode")?;
+                        let _mode = iter.next().context("get tree entry mode")?;
                         let name = iter.next().context("get tree entry name")?;
 
                         match name_only {
@@ -134,6 +138,14 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 _ => todo!(),
+            }
+        }
+        Command::WriteTree => {
+            let path = Path::new(".").to_path_buf();
+            let hash = write_tree(&path)?;
+            if let Some(hash) = hash {
+                let hash_hex = hex::encode(hash);
+                println!("{}", hash_hex);
             }
         }
     }
@@ -163,6 +175,7 @@ impl Kind {
 
 struct Object<R> {
     kind: Kind,
+    #[allow(dead_code)]
     expected_size: u64,
     reader: R,
 }
@@ -194,4 +207,92 @@ impl Object<()> {
             reader: reader.take(size),
         })
     }
+}
+
+fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
+    anyhow::ensure!(path.is_dir(), "write to tree in path: {:?}", path);
+
+    let dir = path.read_dir().unwrap();
+    let mut entries = dir.fold(Vec::new(), |mut acc, x| match x {
+        Ok(entry) => {
+            if entry.file_name() != ".git" {
+                acc.push(entry);
+            }
+            acc
+        }
+        Err(_) => acc,
+    });
+    entries.sort_by(|a, b| a.file_name().partial_cmp(&b.file_name()).unwrap());
+
+    let mut tree_content: Vec<u8> = Vec::new();
+    for entry in entries {
+        let file_name = entry.file_name();
+        let entry_path = entry.path();
+        match entry_path.is_dir() {
+            true => {
+                let hash = write_tree(&entry_path)
+                    .context(format!("write tree on path: {:?}", entry_path))?;
+
+                // append tree entry
+                if let Some(hash) = hash {
+                    tree_content.extend(b"40000 ");
+                    tree_content.extend(file_name.as_encoded_bytes());
+                    tree_content.push(0);
+                    tree_content.extend(hash);
+                }
+            }
+            false => {
+                // prepare git object
+                let mut content = fs::read(&entry_path)?;
+                let mut git_object_formatted_content =
+                    format!("blob {}\0", content.len()).into_bytes();
+                git_object_formatted_content.append(&mut content);
+
+                // do hash
+                let mut hasher = Sha1::new();
+                hasher.update(&git_object_formatted_content[..]);
+                let hash = hasher.finalize();
+                let hash_hex = hex::encode(hash);
+
+                // write git object
+                let target_dir = format!(".git/objects/{}", &hash_hex[..2]);
+                fs::create_dir_all(target_dir.as_str())?;
+                fs::write(
+                    format!("{}/{}", target_dir, &hash_hex[2..]),
+                    encode(&git_object_formatted_content[..])?,
+                )?;
+
+                // append tree entry
+                tree_content.extend(b"100644 ");
+                tree_content.extend(file_name.as_encoded_bytes());
+                tree_content.push(0);
+                tree_content.extend(hash);
+            }
+        }
+    }
+
+    if tree_content.len() == 0 {
+        return Ok(None);
+    }
+
+    // prepare git object
+    let mut git_object_formatted_content = format!("tree {}\0", tree_content.len()).into_bytes();
+    git_object_formatted_content.append(&mut tree_content);
+
+    // do hash
+    let mut hasher = Sha1::new();
+    hasher.update(&git_object_formatted_content[..]);
+    let hash = hasher.finalize();
+    let hash_hex = hex::encode(hash);
+
+    // write git object
+    let target_dir = format!(".git/objects/{}", &hash_hex[..2]);
+    fs::create_dir_all(target_dir.as_str())?;
+    fs::write(
+        format!("{}/{}", target_dir, &hash_hex[2..]),
+        encode(&git_object_formatted_content[..])?,
+    )?;
+
+    // println!("{:?}", hash);
+    Ok(Some(hash.to_vec()))
 }
