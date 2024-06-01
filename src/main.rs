@@ -75,28 +75,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::HashObject { write, file } => {
+            anyhow::ensure!(write, "only support -w");
+
             // prepare git object
             let mut content = fs::read(file)?;
             let mut git_object_formatted_content = format!("blob {}\0", content.len()).into_bytes();
             git_object_formatted_content.append(&mut content);
 
-            // do hash
-            let mut hasher = Sha1::new();
-            hasher.update(&git_object_formatted_content[..]);
-            let sha_hash = format!("{:x}", hasher.finalize());
-            println!("{}", sha_hash);
-
-            // write to .git/objects/ if -w is presented
-            if write {
-                let target_dir = format!(".git/objects/{}", &sha_hash[..2]);
-                if fs::read_dir(target_dir.as_str()).is_err() {
-                    fs::create_dir(target_dir.as_str())?;
-                };
-                fs::write(
-                    format!("{}/{}", target_dir, &sha_hash[2..]),
-                    encode(&git_object_formatted_content[..])?,
-                )?;
-            }
+            let hash = Object::write(&git_object_formatted_content)?;
+            println!("{}", hex::encode(hash));
         }
         Command::LsTree {
             name_only,
@@ -207,6 +194,24 @@ impl Object<()> {
             reader: reader.take(size),
         })
     }
+
+    fn write(content: &[u8]) -> anyhow::Result<Vec<u8>> {
+        // do hash
+        let mut hasher = Sha1::new();
+        hasher.update(&content[..]);
+        let hash = hasher.finalize();
+        let hash_hex = hex::encode(hash);
+
+        // write git object
+        let target_dir = format!(".git/objects/{}", &hash_hex[..2]);
+        fs::create_dir_all(target_dir.as_str())?;
+        fs::write(
+            format!("{}/{}", target_dir, &hash_hex[2..]),
+            encode(&content[..])?,
+        )?;
+
+        Ok(hash.to_vec())
+    }
 }
 
 fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
@@ -247,20 +252,7 @@ fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
                 let mut git_object_formatted_content =
                     format!("blob {}\0", content.len()).into_bytes();
                 git_object_formatted_content.append(&mut content);
-
-                // do hash
-                let mut hasher = Sha1::new();
-                hasher.update(&git_object_formatted_content[..]);
-                let hash = hasher.finalize();
-                let hash_hex = hex::encode(hash);
-
-                // write git object
-                let target_dir = format!(".git/objects/{}", &hash_hex[..2]);
-                fs::create_dir_all(target_dir.as_str())?;
-                fs::write(
-                    format!("{}/{}", target_dir, &hash_hex[2..]),
-                    encode(&git_object_formatted_content[..])?,
-                )?;
+                let hash = Object::write(&git_object_formatted_content)?;
 
                 // append tree entry
                 tree_content.extend(b"100644 ");
@@ -278,21 +270,7 @@ fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
     // prepare git object
     let mut git_object_formatted_content = format!("tree {}\0", tree_content.len()).into_bytes();
     git_object_formatted_content.append(&mut tree_content);
+    let hash = Object::write(&git_object_formatted_content)?;
 
-    // do hash
-    let mut hasher = Sha1::new();
-    hasher.update(&git_object_formatted_content[..]);
-    let hash = hasher.finalize();
-    let hash_hex = hex::encode(hash);
-
-    // write git object
-    let target_dir = format!(".git/objects/{}", &hash_hex[..2]);
-    fs::create_dir_all(target_dir.as_str())?;
-    fs::write(
-        format!("{}/{}", target_dir, &hash_hex[2..]),
-        encode(&git_object_formatted_content[..])?,
-    )?;
-
-    // println!("{:?}", hash);
-    Ok(Some(hash.to_vec()))
+    Ok(Some(hash))
 }
