@@ -46,6 +46,18 @@ enum Command {
     },
 
     WriteTree,
+
+    CommitTree {
+        tree: String,
+
+        /// Each -p indicates the id of a parent commit object.
+        #[arg(short)]
+        parent: Option<String>,
+
+        /// A paragraph in the commit log message. This can be given more than once and each <message> becomes its own paragraph
+        #[arg(short)]
+        message: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -77,12 +89,7 @@ fn main() -> anyhow::Result<()> {
         Command::HashObject { write, file } => {
             anyhow::ensure!(write, "only support -w");
 
-            // prepare git object
-            let mut content = fs::read(file)?;
-            let mut git_object_formatted_content = format!("blob {}\0", content.len()).into_bytes();
-            git_object_formatted_content.append(&mut content);
-
-            let hash = Object::write(&git_object_formatted_content)?;
+            let hash = Object::write(Kind::Blob, &fs::read(file)?)?;
             println!("{}", hex::encode(hash));
         }
         Command::LsTree {
@@ -135,6 +142,25 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", hash_hex);
             }
         }
+        Command::CommitTree {
+            tree,
+            parent,
+            message,
+        } => {
+            let mut content: Vec<u8> = Vec::new();
+            content.extend(format!("tree {}\n", tree).as_bytes());
+            if let Some(parent) = parent {
+                content.extend(format!("parent {}\n", parent).as_bytes());
+            }
+            content.extend(b"author wtlin1228 <wtlin1228@gmail.com> 1717228746 +0800\n");
+            content.extend(b"committer wtlin1228 <wtlin1228@gmail.com> 1717228746 +0800\n");
+            content.push(b'\n');
+            content.extend(message.as_bytes());
+            content.push(b'\n');
+
+            let hash = Object::write(Kind::Commit, &content)?;
+            println!("{}", hex::encode(hash));
+        }
     }
     Ok(())
 }
@@ -148,6 +174,7 @@ fn encode(bytes: &[u8]) -> io::Result<Vec<u8>> {
 enum Kind {
     Blob,
     Tree,
+    Commit,
 }
 
 impl Kind {
@@ -155,7 +182,18 @@ impl Kind {
         match s {
             "blob" => Ok(Self::Blob),
             "tree" => Ok(Self::Tree),
+            "commit" => Ok(Self::Commit),
             _ => anyhow::bail!("invalid kind: {s}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Kind::Blob => write!(f, "blob"),
+            Kind::Tree => write!(f, "tree"),
+            Kind::Commit => write!(f, "commit"),
         }
     }
 }
@@ -195,10 +233,13 @@ impl Object<()> {
         })
     }
 
-    fn write(content: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn write(kind: Kind, content: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut git_object_formatted_content = format!("{} {}\0", kind, content.len()).into_bytes();
+        git_object_formatted_content.extend(content);
+
         // do hash
         let mut hasher = Sha1::new();
-        hasher.update(&content[..]);
+        hasher.update(&git_object_formatted_content[..]);
         let hash = hasher.finalize();
         let hash_hex = hex::encode(hash);
 
@@ -207,7 +248,7 @@ impl Object<()> {
         fs::create_dir_all(target_dir.as_str())?;
         fs::write(
             format!("{}/{}", target_dir, &hash_hex[2..]),
-            encode(&content[..])?,
+            encode(&git_object_formatted_content[..])?,
         )?;
 
         Ok(hash.to_vec())
@@ -247,12 +288,7 @@ fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
                 }
             }
             false => {
-                // prepare git object
-                let mut content = fs::read(&entry_path)?;
-                let mut git_object_formatted_content =
-                    format!("blob {}\0", content.len()).into_bytes();
-                git_object_formatted_content.append(&mut content);
-                let hash = Object::write(&git_object_formatted_content)?;
+                let hash = Object::write(Kind::Blob, &fs::read(&entry_path)?)?;
 
                 // append tree entry
                 tree_content.extend(b"100644 ");
@@ -267,10 +303,6 @@ fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
 
-    // prepare git object
-    let mut git_object_formatted_content = format!("tree {}\0", tree_content.len()).into_bytes();
-    git_object_formatted_content.append(&mut tree_content);
-    let hash = Object::write(&git_object_formatted_content)?;
-
+    let hash = Object::write(Kind::Tree, &tree_content)?;
     Ok(Some(hash))
 }
