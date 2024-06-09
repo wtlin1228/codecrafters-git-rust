@@ -58,6 +58,15 @@ enum Command {
         #[arg(short)]
         message: String,
     },
+
+    Clone {
+        /// The (possibly remote) repository to clone from. See the GIT URLS section below for more information on specifying repositories.
+        repository: String,
+
+        /// The name of a new directory to clone into. The "humanish" part of the source repository is used if no directory is explicitly given (repo
+        /// for /path/to/repo.git and foo for host.xz:foo/.git). Cloning into an existing directory is only allowed if the directory is empty.
+        directory: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -89,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         Command::HashObject { write, file } => {
             anyhow::ensure!(write, "only support -w");
 
-            let hash = Object::write(Kind::Blob, &fs::read(file)?)?;
+            let hash = Object::write(Kind::Blob, &fs::read(file)?, None)?;
             println!("{}", hex::encode(hash));
         }
         Command::LsTree {
@@ -158,11 +167,150 @@ fn main() -> anyhow::Result<()> {
             content.extend(message.as_bytes());
             content.push(b'\n');
 
-            let hash = Object::write(Kind::Commit, &content)?;
+            let hash = Object::write(Kind::Commit, &content, None)?;
             println!("{}", hex::encode(hash));
+        }
+        Command::Clone {
+            repository,
+            directory,
+        } => {
+            let path = PathBuf::from(&directory).join(".git");
+            fs::create_dir_all(&path).unwrap();
+            fs::create_dir(path.join("objects")).unwrap();
+            fs::create_dir(path.join("refs")).unwrap();
+
+            // reference:
+            // - https://git-scm.com/docs/http-protocol/2.16.6
+            // - https://github.com/git/git/blob/795ea8776befc95ea2becd8020c7a284677b4161/Documentation/gitprotocol-pack.txt
+            // - https://github.com/git/git/blob/795ea8776befc95ea2becd8020c7a284677b4161/Documentation/gitprotocol-pack.txt
+            // - https://github.com/git/git/blob/795ea8776befc95ea2becd8020c7a284677b4161/Documentation/gitprotocol-pack.txt
+            // - https://medium.com/@concertdaw/sneaky-git-number-encoding-ddcc5db5329f
+
+            let reference_discovery_url =
+                format!("{}/info/refs?service=git-upload-pack", repository);
+            let mut advertised_refs = reqwest::blocking::get(&reference_discovery_url)
+                .context(format!("GET {}", reference_discovery_url))?;
+            // If HEAD is a valid ref, HEAD MUST appear as the first advertised
+            // ref.  If HEAD is not a valid ref, HEAD MUST NOT appear in the
+            // advertisement list at all, but other refs may still appear.
+            read_pkt_line(&mut advertised_refs)?; // 001e# service=git-upload-pack
+            read_pkt_line(&mut advertised_refs)?; // 0000
+            let first_ref = read_pkt_line(&mut advertised_refs).context("read first-ref")?;
+            let head_object_id =
+                String::from_utf8(first_ref[..40].to_vec()).context("read head object id")?;
+
+            fs::write(path.join("HEAD"), format!("ref: {}\n", head_object_id)).unwrap();
+            println!("Initialized git directory");
+
+            let upload_request = format!("0032want {}\n00000009done\n", head_object_id);
+            let mut server_response = reqwest::blocking::Client::new()
+                .post(format!("{}/git-upload-pack", repository))
+                .header("Content-Type", "application/x-git-upload-pack-request")
+                .body(upload_request)
+                .send()
+                .context(format!("POST {}/git-upload-pack\n", repository))?;
+
+            let mut nak = [0; "0008NAK\n".len()];
+            server_response
+                .read_exact(&mut nak)
+                .context("read `0008NAK\\n`")?;
+            let mut signature = [0; "PACK".len()];
+            server_response
+                .read_exact(&mut signature)
+                .context("read signature `PACK`")?;
+            let mut version_number = [0; 4];
+            server_response
+                .read_exact(&mut version_number)
+                .context("read version-number")?;
+            let mut num_objects = [0; 4];
+            server_response
+                .read_exact(&mut num_objects)
+                .context("read number of objects contained in the pack")?;
+            let num_objects = u32::from_be_bytes(num_objects);
+
+            let mut pack = Vec::new();
+            server_response.read_to_end(&mut pack)?;
+            let checksum = pack.split_off(pack.len() - 20);
+            anyhow::ensure!(hex::encode(checksum).len() == 40);
+
+            let mut object_entries = &pack[..];
+            for _ in 0..num_objects {
+                let mut current_byte: &u8;
+                (current_byte, object_entries) = object_entries
+                    .split_first()
+                    .context("get object's first byte")?;
+                let mut msb = current_byte & 0b1000_0000;
+                let object_type = (current_byte & 0b0111_0000) >> 4;
+                let mut object_size = (current_byte & 0b0000_1111) as usize;
+                let mut shift = 4;
+                while msb > 0 {
+                    (current_byte, object_entries) = object_entries
+                        .split_first()
+                        .context("read one more byte since the last MSB is 1")?;
+                    msb = current_byte & 0b1000_0000;
+                    object_size += ((current_byte & 0b0111_1111) as usize) << shift;
+                    shift += 7;
+                }
+                // - OBJ_COMMIT (1)
+                // - OBJ_TREE (2)
+                // - OBJ_BLOB (3)
+                // - OBJ_TAG (4)
+                // - OBJ_OFS_DELTA (6)
+                // - OBJ_REF_DELTA (7)
+                match object_type {
+                    // OBJ_COMMIT (1) | OBJ_TREE (2) | OBJ_BLOB (3)
+                    1 | 2 | 3 => {
+                        let mut z = ZlibDecoder::new(object_entries);
+                        let mut data = vec![0u8; object_size];
+                        z.read_exact(&mut data).context("read object's content")?;
+                        Object::write(
+                            Kind::from_object_type(object_type)?,
+                            &data,
+                            Some(&directory),
+                        )?;
+                        if object_size == 0 {
+                            // zlib compresses empty bytes into 8 bytes, not 0 bytes
+                            object_entries = &object_entries[8..];
+                        } else {
+                            object_entries = &object_entries[z.total_in() as usize..];
+                        }
+                    }
+                    // OBJ_TAG (4)
+                    4 => anyhow::bail!("invalid object type: OBJ_TAG (4)"),
+                    // OBJ_OFS_DELTA (6)
+                    6 => anyhow::bail!("invalid object type: OBJ_OFS_DELTA (6)"),
+                    // OBJ_REF_DELTA (7)
+                    7 => {
+                        // the object meta information (which we already parsed earlier) is followed
+                        // by the 20-byte name of the base object
+                        object_entries = &object_entries[20..];
+                        let mut z = ZlibDecoder::new(object_entries);
+                        let mut data = vec![0u8; object_size];
+                        z.read_exact(&mut data).context("read object's content")?;
+                        object_entries = &object_entries[z.total_in() as usize..];
+                    }
+                    _ => anyhow::bail!("invalid object type: {}", object_type),
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn read_pkt_line(reader: &mut impl Read) -> anyhow::Result<Vec<u8>> {
+    let mut pkt_length = [0; 4];
+    reader
+        .read_exact(&mut pkt_length)
+        .context("read pkt-length")?;
+    let pkt_length = u32::from_str_radix(&String::from_utf8(pkt_length.to_vec())?, 16)?;
+    if pkt_length == 0 {
+        return Ok(Vec::new());
+    }
+    let mut line = vec![0u8; pkt_length as usize - 4];
+    reader
+        .read_exact(&mut line)
+        .context(format!("read line (length = {})", line.len()))?;
+    Ok(line)
 }
 
 fn encode(bytes: &[u8]) -> io::Result<Vec<u8>> {
@@ -183,7 +331,16 @@ impl Kind {
             "blob" => Ok(Self::Blob),
             "tree" => Ok(Self::Tree),
             "commit" => Ok(Self::Commit),
-            _ => anyhow::bail!("invalid kind: {s}"),
+            _ => anyhow::bail!("invalid kind: {}", s),
+        }
+    }
+
+    fn from_object_type(n: u8) -> anyhow::Result<Self> {
+        match n {
+            1 => Ok(Self::Commit),
+            2 => Ok(Self::Tree),
+            3 => Ok(Self::Blob),
+            _ => anyhow::bail!("invalid kind: {}", n),
         }
     }
 }
@@ -233,7 +390,7 @@ impl Object<()> {
         })
     }
 
-    fn write(kind: Kind, content: &[u8]) -> anyhow::Result<Vec<u8>> {
+    fn write(kind: Kind, content: &[u8], directory: Option<&str>) -> anyhow::Result<Vec<u8>> {
         let mut git_object_formatted_content = format!("{} {}\0", kind, content.len()).into_bytes();
         git_object_formatted_content.extend(content);
 
@@ -244,7 +401,10 @@ impl Object<()> {
         let hash_hex = hex::encode(hash);
 
         // write git object
-        let target_dir = format!(".git/objects/{}", &hash_hex[..2]);
+        let target_dir = match directory {
+            Some(dir) => format!("{}/.git/objects/{}", dir, &hash_hex[..2]),
+            None => format!(".git/objects/{}", &hash_hex[..2]),
+        };
         fs::create_dir_all(target_dir.as_str())?;
         fs::write(
             format!("{}/{}", target_dir, &hash_hex[2..]),
@@ -288,7 +448,7 @@ fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
                 }
             }
             false => {
-                let hash = Object::write(Kind::Blob, &fs::read(&entry_path)?)?;
+                let hash = Object::write(Kind::Blob, &fs::read(&entry_path)?, None)?;
 
                 // append tree entry
                 tree_content.extend(b"100644 ");
@@ -303,6 +463,6 @@ fn write_tree(path: &PathBuf) -> anyhow::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
 
-    let hash = Object::write(Kind::Tree, &tree_content)?;
+    let hash = Object::write(Kind::Tree, &tree_content, None)?;
     Ok(Some(hash))
 }
