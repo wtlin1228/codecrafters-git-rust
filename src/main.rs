@@ -72,10 +72,10 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     match Args::parse().command {
         Command::Init => {
-            fs::create_dir(".git").unwrap();
-            fs::create_dir(".git/objects").unwrap();
-            fs::create_dir(".git/refs").unwrap();
-            fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
+            fs::create_dir(".git")?;
+            fs::create_dir(".git/objects")?;
+            fs::create_dir(".git/refs")?;
+            fs::write(".git/HEAD", "ref: refs/heads/main\n")?;
             println!("Initialized git directory");
         }
         Command::CatFile {
@@ -84,7 +84,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             anyhow::ensure!(pretty_print, "only support -p");
 
-            let mut object = Object::read(&object)?;
+            let mut object = Object::read(&object, None)?;
             match object.kind {
                 Kind::Blob => {
                     let stdout = io::stdout();
@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
             name_only,
             tree_ish,
         } => {
-            let mut object = Object::read(&tree_ish)?;
+            let mut object = Object::read(&tree_ish, None)?;
             match object.kind {
                 Kind::Tree => {
                     let stdout = io::stdout();
@@ -175,9 +175,9 @@ fn main() -> anyhow::Result<()> {
             directory,
         } => {
             let path = PathBuf::from(&directory).join(".git");
-            fs::create_dir_all(&path).unwrap();
-            fs::create_dir(path.join("objects")).unwrap();
-            fs::create_dir(path.join("refs")).unwrap();
+            fs::create_dir_all(&path)?;
+            fs::create_dir(path.join("objects"))?;
+            fs::create_dir(path.join("refs"))?;
 
             // reference:
             // - https://git-scm.com/docs/http-protocol/2.16.6
@@ -198,9 +198,6 @@ fn main() -> anyhow::Result<()> {
             let first_ref = read_pkt_line(&mut advertised_refs).context("read first-ref")?;
             let head_object_id =
                 String::from_utf8(first_ref[..40].to_vec()).context("read head object id")?;
-
-            fs::write(path.join("HEAD"), format!("ref: {}\n", head_object_id)).unwrap();
-            println!("Initialized git directory");
 
             let upload_request = format!("0032want {}\n00000009done\n", head_object_id);
             let mut server_response = reqwest::blocking::Client::new()
@@ -292,6 +289,10 @@ fn main() -> anyhow::Result<()> {
                     _ => anyhow::bail!("invalid object type: {}", object_type),
                 }
             }
+
+            fs::write(path.join("HEAD"), format!("ref: {}\n", head_object_id))?;
+            println!("Initialized git directory");
+            Object::create_file(&head_object_id, &directory, &PathBuf::from(&directory))?;
         }
     }
     Ok(())
@@ -363,9 +364,12 @@ struct Object<R> {
 }
 
 impl Object<()> {
-    fn read(hash: &str) -> anyhow::Result<Object<impl BufRead>> {
+    fn read(hash: &str, directory: Option<&str>) -> anyhow::Result<Object<impl BufRead>> {
         let (folder, filename) = hash.split_at(2);
-        let file_path = format!(".git/objects/{}/{}", folder, filename);
+        let file_path = match directory {
+            Some(dir) => format!("{}/.git/objects/{}/{}", dir, folder, filename),
+            None => format!(".git/objects/{}/{}", folder, filename),
+        };
         let f = fs::File::open(&file_path).context(format!("open file: {}", file_path))?;
         let z = ZlibDecoder::new(f);
         let mut reader = BufReader::new(z);
@@ -412,6 +416,52 @@ impl Object<()> {
         )?;
 
         Ok(hash.to_vec())
+    }
+
+    fn create_file(hash_hex: &str, directory: &str, path: &PathBuf) -> anyhow::Result<()> {
+        let mut object = Object::read(hash_hex, Some(directory))?;
+        match object.kind {
+            Kind::Blob => {
+                let mut f = fs::File::create(path)?;
+                std::io::copy(&mut object.reader, &mut f).context("write blob to file")?;
+            }
+            Kind::Tree => {
+                let mut buf = Vec::new();
+                let mut hashbuf = [0; 20];
+                loop {
+                    buf.clear();
+                    let n = object
+                        .reader
+                        .read_until(0, &mut buf)
+                        .context("read next tree entry")?;
+                    if n == 0 {
+                        break;
+                    }
+                    object
+                        .reader
+                        .read_exact(&mut hashbuf)
+                        .context("read tree entry hash")?;
+
+                    let without_ending_null = buf.split_last().context("split last")?.1;
+                    let mut iter = without_ending_null.splitn(2, |&b| b == b' ');
+                    let mode = iter.next().context("get tree entry mode")?;
+                    let name = iter.next().context("get tree entry name")?;
+                    let path = path.join(String::from_utf8(name.to_vec())?);
+                    if mode == b"40000" {
+                        fs::create_dir(&path)?;
+                    }
+                    Object::create_file(&hex::encode(hashbuf), directory, &path)?;
+                }
+            }
+            Kind::Commit => {
+                let mut tree_label = [0; "tree ".len()];
+                object.reader.read_exact(&mut tree_label)?;
+                let mut hash_hex = [0; 40];
+                object.reader.read_exact(&mut hash_hex)?;
+                Object::create_file(&String::from_utf8(hash_hex.to_vec())?, directory, path)?;
+            }
+        }
+        Ok(())
     }
 }
 
